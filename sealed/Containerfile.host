@@ -40,5 +40,14 @@ COPY app-signing-cert.pem /usr/lib/composefs/app-signing-cert.pem
 COPY etc/systemd/system/composefs-load-appkeys.service /etc/systemd/system/
 COPY usr/lib/composefs/load-app-keys.sh /usr/lib/composefs/
 
-RUN chmod +x /usr/lib/composefs/load-app-keys.sh && \
-    systemctl enable composefs-load-appkeys.service
+# Sealed httpd application service (pulls, mounts, and runs a signed app image)
+COPY etc/default/sealed-httpd /etc/default/sealed-httpd
+COPY etc/systemd/system/sealed-httpd.service /etc/systemd/system/
+COPY usr/lib/composefs/run-sealed-app.sh /usr/lib/composefs/
+COPY usr/lib/composefs/stop-sealed-app.sh /usr/lib/composefs/
+
+RUN chmod +x /usr/lib/composefs/load-app-keys.sh \
+             /usr/lib/composefs/run-sealed-app.sh \
+             /usr/lib/composefs/stop-sealed-app.sh && \
+    systemctl enable composefs-load-appkeys.service && \
+    systemctl enable sealed-httpd.service

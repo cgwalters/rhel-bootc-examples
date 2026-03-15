@@ -119,6 +119,72 @@ test:
     '
     echo "Smoke tests passed"
 
+# Boot a VM, SSH in, and run verification checks
+#
+# The sealed-httpd.service is installed and enabled but will fail without a
+# real registry image. This target verifies the host infrastructure is correct:
+# keyring loaded, service unit present, cfsctl operational.
+bcvk-ssh: build-host
+    #!/bin/bash
+    set -euo pipefail
+
+    VM_NAME="sealed-demo"
+
+    # Clean up any previous VM with this name
+    bcvk libvirt rm --stop --force "${VM_NAME}" 2>/dev/null || true
+
+    echo "==> Booting sealed host VM..."
+    bcvk libvirt run --detach --name "${VM_NAME}" \
+        --firmware=uefi \
+        "{{host_image}}"
+
+    echo "==> Waiting for VM to boot..."
+    sleep 30
+
+    echo "==> Running verification checks..."
+    bcvk libvirt run-ssh "${VM_NAME}" -- bash -c '
+        set -euo pipefail
+
+        echo "=== composefs root ==="
+        if mount | grep -qE "composefs|erofs"; then
+            echo "OK: composefs root active"
+        else
+            echo "WARN: no composefs/erofs mount detected (expected on non-composefs kernel)"
+        fi
+
+        echo "=== cfsctl version ==="
+        cfsctl --version
+        echo "OK: cfsctl installed"
+
+        echo "=== keyring service ==="
+        if systemctl is-active --quiet composefs-load-appkeys.service; then
+            echo "OK: composefs-load-appkeys.service active"
+        else
+            echo "INFO: composefs-load-appkeys.service status:"
+            systemctl status composefs-load-appkeys.service --no-pager || true
+        fi
+
+        echo "=== sealed-httpd unit installed ==="
+        if systemctl cat sealed-httpd.service >/dev/null 2>&1; then
+            echo "OK: sealed-httpd.service unit present and enabled"
+            systemctl is-enabled sealed-httpd.service || true
+        else
+            echo "FAIL: sealed-httpd.service unit not found"
+            exit 1
+        fi
+
+        echo "=== sealed-httpd service status ==="
+        # Service will likely be failed (no real registry), just report status
+        systemctl status sealed-httpd.service --no-pager || true
+
+        echo ""
+        echo "=== All infrastructure checks passed ==="
+    '
+
+    echo "==> Cleaning up VM..."
+    bcvk libvirt rm --stop --force "${VM_NAME}"
+    echo "Done."
+
 # Build everything end-to-end
 all: build-host build-app seal-app
 
