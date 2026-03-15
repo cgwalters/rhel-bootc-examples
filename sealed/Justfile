@@ -93,37 +93,8 @@ seal-app: keygen build-cfsctl build-app
 
     echo "App image sealed and signed successfully"
 
-# Boot the host image in a bcvk VM
-boot: build-host
-    #!/bin/bash
-    set -euo pipefail
-    echo "Booting sealed host with bcvk..."
-    bcvk libvirt run --detach --name sealed-demo \
-        --firmware=uefi \
-        "{{host_image}}"
-
-# Run smoke tests against a running VM
-test:
-    #!/bin/bash
-    set -euo pipefail
-    echo "Running smoke tests..."
-    bcvk libvirt run-ssh sealed-demo -- bash -c '
-        echo "=== Checking composefs root ==="
-        mount | grep composefs || mount | grep erofs
-
-        echo "=== Checking cfsctl ==="
-        cfsctl --version
-
-        echo "=== Checking keyring service ==="
-        systemctl status composefs-load-appkeys.service || true
-    '
-    echo "Smoke tests passed"
-
-# Boot a VM, SSH in, and run verification checks
-#
-# The sealed-httpd.service is installed and enabled but will fail without a
-# real registry image. This target verifies the host infrastructure is correct:
-# keyring loaded, service unit present, cfsctl operational.
+# Boot a VM, wait for multi-user.target (which includes sealed-httpd.service),
+# then verify everything came up.
 bcvk-ssh: build-host
     #!/bin/bash
     set -euo pipefail
@@ -138,47 +109,39 @@ bcvk-ssh: build-host
         --firmware=uefi \
         "{{host_image}}"
 
-    echo "==> Waiting for VM to boot..."
-    sleep 30
+    echo "==> Waiting for multi-user.target (timeout 90s)..."
+    # Wait for multi-user.target to be reached — this means all WantedBy=
+    # services (including sealed-httpd.service) have been started.
+    bcvk libvirt run-ssh "${VM_NAME}" -- \
+        timeout 90 bash -c \
+            'journalctl -b --no-pager -o cat UNIT=multi-user.target -n 0 --follow | grep -q -m1 "Reached target" || systemctl is-active multi-user.target'
 
-    echo "==> Running verification checks..."
+    echo "==> multi-user.target reached, running checks..."
     bcvk libvirt run-ssh "${VM_NAME}" -- bash -c '
         set -euo pipefail
+        failed=0
 
-        echo "=== composefs root ==="
-        if mount | grep -qE "composefs|erofs"; then
-            echo "OK: composefs root active"
-        else
-            echo "WARN: no composefs/erofs mount detected (expected on non-composefs kernel)"
-        fi
+        echo "--- composefs root ---"
+        mount | grep -E "composefs|erofs" || echo "WARN: no composefs mount (non-composefs boot)"
 
-        echo "=== cfsctl version ==="
+        echo "--- cfsctl ---"
         cfsctl --version
-        echo "OK: cfsctl installed"
 
-        echo "=== keyring service ==="
-        if systemctl is-active --quiet composefs-load-appkeys.service; then
-            echo "OK: composefs-load-appkeys.service active"
-        else
-            echo "INFO: composefs-load-appkeys.service status:"
-            systemctl status composefs-load-appkeys.service --no-pager || true
-        fi
+        echo "--- composefs-load-appkeys.service ---"
+        systemctl status composefs-load-appkeys.service --no-pager || failed=1
 
-        echo "=== sealed-httpd unit installed ==="
-        if systemctl cat sealed-httpd.service >/dev/null 2>&1; then
-            echo "OK: sealed-httpd.service unit present and enabled"
-            systemctl is-enabled sealed-httpd.service || true
+        echo "--- sealed-httpd.service ---"
+        systemctl status sealed-httpd.service --no-pager || failed=1
+
+        if [ "$failed" -eq 0 ]; then
+            echo ""
+            echo "=== ALL CHECKS PASSED ==="
         else
-            echo "FAIL: sealed-httpd.service unit not found"
+            echo ""
+            echo "=== SOME CHECKS FAILED (see above) ==="
+            journalctl -b -u sealed-httpd.service --no-pager
             exit 1
         fi
-
-        echo "=== sealed-httpd service status ==="
-        # Service will likely be failed (no real registry), just report status
-        systemctl status sealed-httpd.service --no-pager || true
-
-        echo ""
-        echo "=== All infrastructure checks passed ==="
     '
 
     echo "==> Cleaning up VM..."
