@@ -1,116 +1,83 @@
 # Sealed composefs demo
 
-This demo builds a CentOS Stream 10 bootc host image with a fully verified
-boot chain and a sealed application container (httpd) that is
-cryptographically verified at mount time using fs-verity signatures.
+This demo builds a CentOS Stream 10 bootc host image that can run sealed
+application containers verified at mount time using composefs fs-verity
+signatures.
 
 ## What this proves
 
-The host OS boots through a chain where each stage verifies the next:
-
-```
-  UEFI Secure Boot
-       |
-       v
-  Signed UKI (systemd-boot → kernel+initramfs)
-       |  cmdline contains composefs=<fsverity-digest>
-       v
-  composefs root filesystem (verified by digest)
-       |
-       v
-  .fs-verity keyring (app-signing-cert loaded at boot)
-       |
-       v
-  Sealed app container (crun mounts via composefs, kernel enforces signatures)
-```
-
-Secure Boot guarantees the UKI hasn't been tampered with. The UKI's
-embedded kernel command line pins the composefs root image to an exact
-fs-verity digest, so the OS image is immutable. Once booted, a systemd
-service loads the composefs signing certificate into the kernel's
+The host boots with composefs as the root filesystem. At boot, a systemd
+service loads a composefs app-signing certificate into the kernel's
 `.fs-verity` keyring. When crun mounts a sealed application container
 through composefs, the kernel verifies every file's content against the
-fs-verity signature that was created at build time with the corresponding
-private key.
+fs-verity signature created at build time with the corresponding private
+key.
 
-The result: an unbroken trust chain from firmware to application container,
-with no runtime signature checking in userspace. The kernel does all
-verification.
+```
+  bootc composefs root (digest verified by kernel)
+       |
+       v
+  .fs-verity keyring (app-signing cert loaded at boot)
+       |
+       v
+  Sealed app container (crun mounts via composefs, kernel enforces sigs)
+```
+
+CentOS Stream 10 bootc ships with composefs support built in — the dracut
+module, composefs-setup-root, SELinux policy, and systemd-networkd are all
+part of the base image. This demo only adds cfsctl, crun, and the
+app-signing certificate.
 
 ## Prerequisites
 
-- podman (with heredoc syntax support, i.e. podman >= 4.7)
-- openssl (for key generation)
-- cfsctl (built from this repo or installed)
-- bcvk (for local VM testing, from bootc-dev/bcvk)
+- podman (>= 4.7 for heredoc syntax)
+- openssl
+- cargo (Rust toolchain)
 - just (task runner)
-
-For the GHA workflow, you also need repository secrets for the signing keys.
+- bcvk (for local VM testing, from bootc-dev/bcvk)
 
 ## Local workflow
 
-Generate keys, build both images, seal the app, and boot:
-
 ```
-just keygen
-just build-host
-just build-app
-just seal-app
-just boot
-```
-
-The `keygen` target creates Secure Boot keys (PK, KEK, db) and a composefs
-signing keypair under `target/keys/`. The host build embeds the composefs
-signing certificate and configures Secure Boot UKI signing. The app build
-produces a plain httpd container. The `seal-app` step pulls the app image
-into a cfsctl repo, seals it, and signs it with the composefs private key.
-Finally `boot` launches a bcvk VM with the host image using Secure Boot.
-
-Once the VM is running, the sealed app can be launched:
-
-```
-just test
+just keygen        # Generate composefs signing keypair
+just build-host    # Build cfsctl + host container image
+just build-app     # Build the httpd app container
+just seal-app      # Seal and sign the app image
+just boot          # Boot the host in a bcvk VM
+just test          # SSH in and verify
 ```
 
-This SSHs into the VM, verifies the composefs root is mounted, then runs
-the sealed httpd container with podman (which delegates to crun, which
-mounts the sealed composefs image with signature verification).
+The `keygen` target creates a composefs signing keypair under `target/keys/`.
+The host build installs cfsctl and crun, embeds the signing certificate, and
+adds a systemd service that loads the cert into the kernel keyring at boot.
+The `seal-app` step pulls the app image into a cfsctl repo, seals it, and
+signs it with the composefs private key. The `boot` target launches a bcvk
+VM with the host image.
 
 ## GHA workflow
 
-The `.github/workflows/build-sealed.yml` workflow automates this for CI.
-It expects four repository secrets:
+The `.github/workflows/build-sealed.yml` workflow automates the build for CI.
+It expects two repository secrets:
 
-- `SECUREBOOT_DB_KEY` — PEM-encoded Secure Boot db signing key
-- `SECUREBOOT_DB_CERT` — PEM-encoded Secure Boot db signing certificate
 - `COMPOSEFS_SIGNING_KEY` — PEM-encoded composefs signing private key
 - `COMPOSEFS_SIGNING_CERT` — PEM-encoded composefs signing certificate
 
-The workflow builds the host image with these keys passed as podman
-build secrets, then builds and seals the app image in a separate job.
-An optional third job boots the image in a bcvk VM on a self-hosted
-runner with libvirt.
+The workflow builds cfsctl from source, builds the host image with the
+signing cert embedded, then builds and seals the app image in a separate job.
 
 ## Key details
 
 ### Hash algorithm
 
 This demo uses `fsverity-sha256-12` for broader filesystem compatibility.
-For production use, `fsverity-sha512-12` is recommended for stronger
-security guarantees.
+Production deployments may prefer `fsverity-sha512-12` for stronger hashes.
 
 ### Host image (Containerfile.host)
 
-Two-stage build following the composefs-rs UKI pattern:
-
-1. `base` stage: installs packages, embeds the signing cert, adds dracut
-   and systemd config for loading the cert into the kernel keyring at boot.
-
-2. `kernel` stage: mounts the base image, computes the composefs fs-verity
-   digest with cfsctl, bakes it into the kernel command line, then builds
-   the UKI signed with the Secure Boot db key.
-
-The final image is the base with `/boot` from the kernel stage.
+A single-stage build on centos-bootc:stream10. Installs crun and cfsctl,
+embeds the app-signing certificate, and enables the keyring-loading
+systemd service. The composefs digest injection and UKI building are
+handled by `bootc install` at deploy time.
 
 ### App image (Containerfile.app)
 
@@ -121,12 +88,13 @@ happens at build time — sealing is a post-build step.
 
 After the app image is built:
 
-1. `cfsctl oci pull` imports it into a composefs repository
-2. `cfsctl oci seal` creates a sealed manifest with embedded fs-verity digests
-3. `cfsctl oci sign --cert ... --key ...` creates a PKCS#7 signature artifact
+1. `cfsctl init` creates a composefs repository
+2. `cfsctl oci pull` imports the app image
+3. `cfsctl oci seal` creates a sealed manifest with fs-verity digests
+4. `cfsctl oci sign` creates a PKCS#7 signature artifact
 
-The sealed image can then be mounted with `cfsctl oci mount --require-signature`
-or run via crun's composefs integration.
+The sealed image can then be run via crun's composefs integration, which
+verifies signatures against the `.fs-verity` keyring.
 
 ---
 

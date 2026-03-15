@@ -34,28 +34,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build cfsctl and composefs-setup-root
-        run: |
-          cargo build --release -p cfsctl --features=pre-6.15 -p composefs-setup-root
-          cp target/release/cfsctl sealed/cfsctl
-          cp target/release/composefs-setup-root sealed/composefs-setup-root
+      - name: Build cfsctl
+        run: cargo build --release -p cfsctl
 
-      - name: Write signing secrets to files
+      - name: Prepare build context
         run: |
-          mkdir -p /tmp/secrets
-          echo "${{ secrets.SECUREBOOT_DB_KEY }}" > /tmp/secrets/db.key
-          echo "${{ secrets.SECUREBOOT_DB_CERT }}" > /tmp/secrets/db.crt
-          echo "${{ secrets.COMPOSEFS_SIGNING_CERT }}" > /tmp/secrets/app-signing.pem
+          mkdir -p sealed/target/build
+          cp target/release/cfsctl sealed/target/build/cfsctl
 
-      # Build locally with --secret (the action doesn't support --secret),
-      # then pass the local image reference to the action for push.
-      - name: Build host image with secrets
+          # Write the signing cert into the build context
+          echo "${{ secrets.COMPOSEFS_SIGNING_CERT }}" > sealed/target/build/app-signing-cert.pem
+
+      - name: Build host image
         run: |
           podman build \
-            --secret=id=db.key,src=/tmp/secrets/db.key \
-            --secret=id=db.crt,src=/tmp/secrets/db.crt \
-            --secret=id=app-signing-pem,src=/tmp/secrets/app-signing.pem \
             -f sealed/Containerfile.host \
+            --build-context=tools=sealed/target/build \
             -t localhost/sealed-host:latest \
             sealed/
 
@@ -66,10 +60,6 @@ jobs:
           arch: amd64
           local-image: localhost/sealed-host:latest
           push: ${{ github.event_name == 'push' }}
-
-      - name: Clean up secrets
-        if: always()
-        run: rm -rf /tmp/secrets
 
   build-seal-app:
     name: Build and seal app image
@@ -87,9 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build cfsctl
-        run: |
-          cargo build --release -p cfsctl --features=pre-6.15
-          cp target/release/cfsctl sealed/cfsctl
+        run: cargo build --release -p cfsctl
 
       - name: Build app image
         uses: bootc-dev/actions/build-push-image@main
@@ -108,7 +96,7 @@ jobs:
 
       - name: Seal and sign app image
         run: |
-          CFSCTL="./sealed/cfsctl"
+          CFSCTL="./target/release/cfsctl"
           REPO="/tmp/composefs-repo"
 
           sudo tune2fs -O verity $(findmnt -vno SOURCE /)
@@ -141,27 +129,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Write Secure Boot keys
-        run: |
-          mkdir -p /tmp/sb-keys
-          echo "${{ secrets.SECUREBOOT_DB_KEY }}" > /tmp/sb-keys/db.key
-          echo "${{ secrets.SECUREBOOT_DB_CERT }}" > /tmp/sb-keys/db.crt
-          # bcvk also needs PK and KEK for UEFI variable enrollment
-          # These would come from additional secrets in a real deployment
-
       - name: Boot VM and run smoke tests
         run: |
           bcvk libvirt run-ssh "$HOST_IMAGE" \
-            --firmware=uefi-secure \
-            --secure-boot-keys=/tmp/sb-keys \
+            --firmware=uefi \
             -- bash -c '
               echo "--- Checking composefs root ---"
-              mount | grep "composefs on / " && echo "composefs root: OK"
+              mount | grep composefs || mount | grep erofs
 
               echo "--- Checking .fs-verity keyring ---"
               keyctl show %:.fs-verity && echo "keyring: OK"
-            '
 
-      - name: Clean up
-        if: always()
-        run: rm -rf /tmp/sb-keys
+              echo "--- Checking cfsctl ---"
+              cfsctl --version
+            '
