@@ -8,17 +8,33 @@
 # `bootc install` at deploy time — the Containerfile just builds
 # the OS content layer.
 
+# --- Stage 1: Build cfsctl from composefs-rs source ---
+#
+# ARG lets CI override the branch/ref to build from.
+ARG COMPOSEFS_RS_REPO=https://github.com/composefs/composefs-rs
+ARG COMPOSEFS_RS_REF=main
+
+FROM quay.io/centos/centos:stream10 AS build
+ARG COMPOSEFS_RS_REPO
+ARG COMPOSEFS_RS_REF
+
+RUN dnf -y install git cargo rust openssl-devel && dnf clean all
+RUN git clone --branch "${COMPOSEFS_RS_REF}" --depth=1 \
+        "${COMPOSEFS_RS_REPO}" /src/composefs-rs
+RUN cargo build --release --manifest-path /src/composefs-rs/Cargo.toml -p cfsctl
+
+# --- Stage 2: The actual bootc host image ---
 FROM quay.io/centos-bootc/centos-bootc:stream10
 
-# Install composefs tooling for app container sealing
+# Install container runtime for running sealed app containers
 RUN dnf -y install crun && dnf clean all
 
-# Install cfsctl (built from composefs-rs)
-COPY --from=tools cfsctl /usr/bin/cfsctl
+# Install cfsctl built from source in stage 1
+COPY --from=build /src/composefs-rs/target/release/cfsctl /usr/bin/cfsctl
 
 # Embed the composefs app-signing certificate (public key — not secret).
 # At boot, a systemd service loads this into the kernel .fs-verity keyring.
-COPY --from=tools app-signing-cert.pem /usr/lib/composefs/app-signing-cert.pem
+COPY app-signing-cert.pem /usr/lib/composefs/app-signing-cert.pem
 
 # Systemd service + script to load the signing cert into the kernel keyring
 COPY etc/systemd/system/composefs-load-appkeys.service /etc/systemd/system/
