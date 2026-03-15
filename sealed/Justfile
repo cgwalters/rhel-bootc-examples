@@ -15,10 +15,6 @@
 # Path to composefs-rs source tree (for local cfsctl builds used in seal-app)
 composefs_src := env("COMPOSEFS_SRC", justfile_directory() + "/../../..")
 
-# composefs-rs git ref to build inside the host container image
-composefs_rs_ref := env("COMPOSEFS_RS_REF", "main")
-composefs_rs_repo := env("COMPOSEFS_RS_REPO", "https://github.com/composefs/composefs-rs")
-
 # Local image names
 host_image := "localhost/sealed-host:latest"
 app_image := "localhost/sealed-app:latest"
@@ -48,14 +44,14 @@ build-cfsctl:
 # Build the sealed host image
 #
 # cfsctl is built from source INSIDE the container build (multi-stage).
-# The signing cert is copied from the build context.
+# The local composefs-rs tree is passed as a build context so we get
+# the sealing/signing support from the current branch.
 build-host: keygen
     #!/bin/bash
     set -euo pipefail
     cp "{{keys_dir}}/composefs-signing.pem" app-signing-cert.pem
     podman build -f Containerfile.host \
-        --build-arg COMPOSEFS_RS_REF="{{composefs_rs_ref}}" \
-        --build-arg COMPOSEFS_RS_REPO="{{composefs_rs_repo}}" \
+        --build-context "composefs-src={{composefs_src}}" \
         -t "{{host_image}}" .
     rm -f app-signing-cert.pem
     echo "Host image built: {{host_image}}"
@@ -105,19 +101,19 @@ bcvk-ssh: build-host
     bcvk libvirt rm --stop --force "${VM_NAME}" 2>/dev/null || true
 
     echo "==> Booting sealed host VM..."
-    bcvk libvirt run --detach --name "${VM_NAME}" \
-        --firmware=uefi \
+    bcvk libvirt run --detach --ssh-wait --name "${VM_NAME}" \
+        --composefs-backend --filesystem=ext4 \
         "{{host_image}}"
 
     echo "==> Waiting for multi-user.target (timeout 90s)..."
     # Wait for multi-user.target to be reached — this means all WantedBy=
     # services (including sealed-httpd.service) have been started.
-    bcvk libvirt run-ssh "${VM_NAME}" -- \
+    bcvk libvirt ssh "${VM_NAME}" -- \
         timeout 90 bash -c \
-            'journalctl -b --no-pager -o cat UNIT=multi-user.target -n 0 --follow | grep -q -m1 "Reached target" || systemctl is-active multi-user.target'
+            'systemctl is-active multi-user.target || journalctl -b --no-pager -o cat UNIT=multi-user.target --follow | grep -q -m1 "Reached target"'
 
     echo "==> multi-user.target reached, running checks..."
-    bcvk libvirt run-ssh "${VM_NAME}" -- bash -c '
+    bcvk libvirt ssh "${VM_NAME}" -- bash -c '
         set -euo pipefail
         failed=0
 
