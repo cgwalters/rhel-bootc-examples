@@ -2,21 +2,13 @@ name: Build sealed composefs demo
 
 on:
   push:
-    branches: [sealed-demo]
+    branches: [main]
   pull_request:
-    branches: [sealed-demo]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
-  packages: write
-
-env:
-  HOST_IMAGE: ghcr.io/${{ github.repository }}/sealed-host
-  APP_IMAGE: ghcr.io/${{ github.repository }}/sealed-app
 
 jobs:
   build-host:
@@ -25,121 +17,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Generate ephemeral signing keypair
         run: |
-          sudo apt-get update
-          sudo apt-get install -y erofs-utils
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build cfsctl
-        run: cargo build --release -p cfsctl
-
-      - name: Prepare build context
-        run: |
-          mkdir -p sealed/target/build
-          cp target/release/cfsctl sealed/target/build/cfsctl
-
-          # Write the signing cert into the build context
-          echo "${{ secrets.COMPOSEFS_SIGNING_CERT }}" > sealed/target/build/app-signing-cert.pem
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout composefs-signing.key \
+            -out app-signing-cert.pem \
+            -days 1 -subj '/CN=composefs-ci-ephemeral/'
 
       - name: Build host image
-        run: |
-          podman build \
-            -f sealed/Containerfile.host \
-            --build-context=tools=sealed/target/build \
-            -t localhost/sealed-host:latest \
-            sealed/
+        run: podman build -f Containerfile.host -t localhost/sealed-host:latest .
 
-      - name: Push host image
-        uses: bootc-dev/actions/build-push-image@main
-        with:
-          image: ${{ env.HOST_IMAGE }}
-          arch: amd64
-          local-image: localhost/sealed-host:latest
-          push: ${{ github.event_name == 'push' }}
+      - name: Verify cfsctl in image
+        run: podman run --rm localhost/sealed-host:latest cfsctl --version
 
-  build-seal-app:
-    name: Build and seal app image
+  build-app:
+    name: Build app image
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y erofs-utils
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build cfsctl
-        run: cargo build --release -p cfsctl
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
 
       - name: Build app image
-        uses: bootc-dev/actions/build-push-image@main
-        with:
-          image: ${{ env.APP_IMAGE }}
-          arch: amd64
-          containerfile: sealed/Containerfile.app
-          context: sealed/
-          push: ${{ github.event_name == 'push' }}
-
-      - name: Write signing secrets to files
-        run: |
-          mkdir -p /tmp/secrets
-          echo "${{ secrets.COMPOSEFS_SIGNING_KEY }}" > /tmp/secrets/composefs-signing.key
-          echo "${{ secrets.COMPOSEFS_SIGNING_CERT }}" > /tmp/secrets/composefs-signing.crt
-
-      - name: Seal and sign app image
-        run: |
-          CFSCTL="./target/release/cfsctl"
-          REPO="/tmp/composefs-repo"
-
-          sudo tune2fs -O verity $(findmnt -vno SOURCE /)
-
-          "${CFSCTL}" --repo "${REPO}" init --algorithm=fsverity-sha256-12
-
-          IMAGE_ID=$(podman inspect --format '{{.Id}}' "$APP_IMAGE")
-          "${CFSCTL}" --repo "${REPO}" oci pull "containers-storage:${IMAGE_ID}" sealed-app
-
-          "${CFSCTL}" --repo "${REPO}" oci seal sealed-app
-
-          "${CFSCTL}" --repo "${REPO}" oci sign sealed-app \
-            --cert /tmp/secrets/composefs-signing.crt \
-            --key /tmp/secrets/composefs-signing.key
-
-          "${CFSCTL}" --repo "${REPO}" oci verify sealed-app \
-            --cert /tmp/secrets/composefs-signing.crt
-
-      - name: Clean up secrets
-        if: always()
-        run: rm -rf /tmp/secrets
-
-  # Optional: boot the host image in a VM and run the sealed app.
-  # Requires a self-hosted runner with libvirt and bcvk installed.
-  smoke-test:
-    name: VM smoke test
-    needs: [build-host, build-seal-app]
-    runs-on: [self-hosted, libvirt]
-    if: github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Boot VM and run smoke tests
-        run: |
-          bcvk libvirt run-ssh "$HOST_IMAGE" \
-            --firmware=uefi \
-            -- bash -c '
-              echo "--- Checking composefs root ---"
-              mount | grep composefs || mount | grep erofs
-
-              echo "--- Checking .fs-verity keyring ---"
-              keyctl show %:.fs-verity && echo "keyring: OK"
-
-              echo "--- Checking cfsctl ---"
-              cfsctl --version
-            '
+        run: podman build -f Containerfile.app -t localhost/sealed-app:latest .

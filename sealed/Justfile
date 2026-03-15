@@ -44,14 +44,13 @@ build-cfsctl:
 # Build the sealed host image
 #
 # cfsctl is built from source INSIDE the container build (multi-stage).
-# The local composefs-rs tree is passed as a build context so we get
-# the sealing/signing support from the current branch.
+# By default clones from cgwalters/playground composefs branch; override
+# with COMPOSEFS_RS_REPO/COMPOSEFS_RS_REF env vars for local dev.
 build-host: keygen
     #!/bin/bash
     set -euo pipefail
     cp "{{keys_dir}}/composefs-signing.pem" app-signing-cert.pem
     podman build -f Containerfile.host \
-        --build-context "composefs-src={{composefs_src}}" \
         -t "{{host_image}}" .
     rm -f app-signing-cert.pem
     echo "Host image built: {{host_image}}"

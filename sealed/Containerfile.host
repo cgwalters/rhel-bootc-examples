@@ -9,10 +9,16 @@
 # the OS content layer.
 
 # --- Stage 1: Build cfsctl from composefs-rs source ---
-FROM quay.io/centos/centos:stream10 AS build
+ARG COMPOSEFS_RS_REPO=https://github.com/cgwalters/ci-sandbox
+ARG COMPOSEFS_RS_REF=composefs
 
-RUN dnf -y install cargo rust openssl-devel && dnf clean all
-COPY --from=composefs-src . /src/composefs-rs
+FROM quay.io/centos/centos:stream10 AS build
+ARG COMPOSEFS_RS_REPO
+ARG COMPOSEFS_RS_REF
+
+RUN dnf -y install cargo rust openssl-devel git && dnf clean all
+RUN GIT_TERMINAL_PROMPT=0 git -c credential.helper= clone --branch "${COMPOSEFS_RS_REF}" --depth=1 \
+        "${COMPOSEFS_RS_REPO}" /src/composefs-rs
 RUN cargo build --release --manifest-path /src/composefs-rs/Cargo.toml -p cfsctl
 
 # --- Stage 2: The actual bootc host image ---
