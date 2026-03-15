@@ -1,0 +1,125 @@
+# Containerfile.host — Sealed bootc host image with composefs app signing
+#
+# Two-stage build:
+#   1. 'base' — OS content with composefs tooling and signing cert embedded
+#   2. 'kernel' — UKI built with composefs digest baked into cmdline
+#
+# Build secrets (passed via --secret):
+#   db.key, db.crt   — Secure Boot signing key/cert for UKI
+#   app-signing-pem   — composefs signing cert to embed in the image
+#
+# This is a demo/PoC. Not for production use without further hardening.
+
+FROM quay.io/centos-bootc/centos-bootc:stream10 AS base
+
+# Install composefs tooling, container runtime, and boot infrastructure
+RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
+    set -eux
+    dnf --setopt keepcache=1 install -y \
+        crun \
+        podman \
+        composefs \
+        dosfstools \
+        kernel \
+        openssh-server \
+        policycoreutils-python-utils \
+        sbsigntools \
+        selinux-policy-targeted \
+        systemd \
+        systemd-boot-unsigned \
+        systemd-networkd \
+        systemd-resolved \
+        systemd-ukify \
+        util-linux
+EOF
+
+# Install cfsctl and composefs-setup-root from the build context.
+# In CI these are pre-built; locally the Justfile builds them from source.
+COPY cfsctl /usr/bin/cfsctl
+COPY composefs-setup-root /usr/lib/dracut/modules.d/37composefs/composefs-setup-root
+
+# Install SELinux workaround policy module
+COPY etc/composefs_workarounds.te /etc/composefs_workarounds.te
+
+# Embed the composefs signing certificate for app verification.
+# At boot, a systemd service loads this into the kernel's .fs-verity keyring.
+RUN --mount=type=secret,id=app-signing-pem <<EOF
+    set -eux
+    mkdir -p /usr/lib/composefs
+    cp /run/secrets/app-signing-pem /usr/lib/composefs/app-signing-cert.pem
+EOF
+
+# Install systemd units and network config
+COPY etc/systemd/system/composefs-load-appkeys.service /etc/systemd/system/
+COPY usr/lib/composefs/load-app-keys.sh /usr/lib/composefs/load-app-keys.sh
+COPY usr/lib/systemd/network/37-wired.network /usr/lib/systemd/network/
+
+# Install the dracut module for composefs root setup
+COPY dracut/ /usr/lib/dracut/
+
+RUN <<EOF
+    set -eux
+
+    chmod 0755 /usr/lib/composefs/load-app-keys.sh
+
+    # Compile and install SELinux workaround policy
+    checkmodule -M -m -o /etc/composefs_workarounds.mod /etc/composefs_workarounds.te
+    semodule_package -o /etc/composefs_workarounds.pp -m /etc/composefs_workarounds.mod
+    semodule -i /etc/composefs_workarounds.pp
+
+    # Enable networking (needed for VM SSH access via bcvk)
+    systemctl enable systemd-networkd systemd-resolved
+
+    # Enable the key-loading service and SSH
+    systemctl enable composefs-load-appkeys.service
+    systemctl enable sshd.service
+
+    # dracut config: include composefs cert and tools in initramfs, disable xattr
+    mkdir -p /etc/dracut.conf.d
+    echo 'export DRACUT_NO_XATTR=1' > /etc/dracut.conf.d/no-xattr.conf
+
+    # UKI config for kernel-install
+    mkdir -p /usr/lib/kernel/install.conf.d
+    cat > /usr/lib/kernel/install.conf.d/37composefs.conf <<'KICONF'
+layout = uki
+uki_generator = ukify
+KICONF
+
+    # Allow empty root password for demo (do NOT do this in production)
+    passwd -d root
+    mkdir -p /sysroot
+EOF
+
+# -- kernel stage: compute composefs digest, build signed UKI --
+FROM base AS kernel
+
+# Secure Boot UKI signing configuration
+RUN mkdir -p /etc/kernel && \
+    cat > /etc/kernel/uki.conf <<'UKICONF'
+[UKI]
+SecureBootSigningTool=sbsign
+SecureBootPrivateKey=/run/secrets/db.key
+SecureBootCertificate=/run/secrets/db.crt
+UKICONF
+
+# Mount the base stage as a read-only filesystem, compute the composefs
+# digest, embed it in the kernel command line, then build the UKI.
+RUN --mount=type=bind,from=base,target=/mnt/base \
+    --mount=type=secret,id=db.key \
+    --mount=type=secret,id=db.crt <<EOF
+    set -eux
+
+    # Compute the composefs image ID from the base filesystem
+    mkdir -p /tmp/sysroot/composefs
+    COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot --hash sha256 compute-id --bootable /mnt/base)"
+
+    mkdir -p /etc/kernel
+    echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+
+    # Build UKI (kernel-install invokes ukify + sbsign via uki.conf)
+    kernel-install add-all
+EOF
+
+# -- final image: base content + signed /boot from kernel stage --
+FROM base AS bootable
+COPY --from=kernel /boot /boot

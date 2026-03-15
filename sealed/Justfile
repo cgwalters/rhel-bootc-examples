@@ -1,0 +1,169 @@
+# Justfile for sealed composefs demo
+#
+# Builds a CentOS Stream 10 bootc host with composefs app-signing keys
+# and a sealed httpd application container verified at mount time.
+#
+# Prerequisites: podman, openssl, just, bcvk
+# For local dev: cfsctl is built from the parent composefs-rs repo.
+
+# Path to composefs-rs source tree (parent of this demo)
+composefs_src := env("COMPOSEFS_SRC", justfile_directory() + "/../../..")
+
+# Base image for host
+base_image := "quay.io/centos-bootc/centos-bootc:stream10"
+
+# Local image names
+host_image := "localhost/sealed-host:latest"
+app_image := "localhost/sealed-app:latest"
+
+# Key material directory
+keys_dir := justfile_directory() + "/target/keys"
+
+# cfsctl repo for sealed app images
+repo_dir := justfile_directory() + "/target/composefs-repo"
+
+# Generate all key material: Secure Boot keys (PK, KEK, db) and composefs signing keypair
+keygen:
+    #!/bin/bash
+    set -euo pipefail
+    mkdir -p "{{keys_dir}}"
+
+    if [ -f "{{keys_dir}}/.done" ]; then
+        echo "Keys already exist in {{keys_dir}}, skipping"
+        exit 0
+    fi
+
+    echo "Generating Secure Boot keys..."
+    systemd-id128 new -u > "{{keys_dir}}/GUID.txt"
+
+    for name_cn in "PK:Test Platform Key" "KEK:Test Key Exchange Key" "db:Test Signature Database key"; do
+        name="${name_cn%%:*}"
+        cn="${name_cn#*:}"
+        openssl req -newkey rsa:4096 -nodes \
+            -keyout "{{keys_dir}}/${name}.key" \
+            -new -x509 -sha256 -days 3650 \
+            -subj "/CN=${cn}/" \
+            -out "{{keys_dir}}/${name}.crt"
+        openssl x509 -outform DER \
+            -in "{{keys_dir}}/${name}.crt" \
+            -out "{{keys_dir}}/${name}.cer"
+    done
+
+    echo "Generating composefs signing keypair..."
+    openssl req -newkey rsa:4096 -nodes \
+        -keyout "{{keys_dir}}/composefs-signing.key" \
+        -new -x509 -sha256 -days 3650 \
+        -subj "/CN=composefs app signing key/" \
+        -out "{{keys_dir}}/composefs-signing.crt"
+
+    touch "{{keys_dir}}/.done"
+    echo "Keys generated in {{keys_dir}}"
+
+# Build cfsctl and composefs-setup-root from the parent composefs-rs repo
+_build-tools:
+    #!/bin/bash
+    set -euo pipefail
+    echo "Building cfsctl and composefs-setup-root..."
+    cargo build --release --manifest-path "{{composefs_src}}/Cargo.toml" \
+        -p cfsctl --features=pre-6.15 -p composefs-setup-root
+    cp "{{composefs_src}}/target/release/cfsctl" "{{justfile_directory()}}/cfsctl"
+    cp "{{composefs_src}}/target/release/composefs-setup-root" "{{justfile_directory()}}/composefs-setup-root"
+
+# Build the sealed host image (two-stage UKI with Secure Boot)
+build-host: keygen _build-tools
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "Building host image..."
+    podman build \
+        --secret=id=db.key,src="{{keys_dir}}/db.key" \
+        --secret=id=db.crt,src="{{keys_dir}}/db.crt" \
+        --secret=id=app-signing-pem,src="{{keys_dir}}/composefs-signing.crt" \
+        -f Containerfile.host \
+        -t "{{host_image}}" \
+        .
+
+    echo "Host image built: {{host_image}}"
+
+# Build the httpd application image (plain OCI, not sealed yet)
+build-app:
+    #!/bin/bash
+    set -euo pipefail
+    echo "Building app image..."
+    podman build \
+        -f Containerfile.app \
+        -t "{{app_image}}" \
+        .
+    echo "App image built: {{app_image}}"
+
+# Seal and sign the app image with composefs keys
+seal-app: build-app keygen _build-tools
+    #!/bin/bash
+    set -euo pipefail
+
+    CFSCTL="{{justfile_directory()}}/cfsctl"
+    REPO="{{repo_dir}}"
+
+    echo "Initializing composefs repo..."
+    "${CFSCTL}" --repo "${REPO}" init --algorithm=fsverity-sha256-12
+
+    echo "Pulling app image into composefs repo..."
+    IMAGE_ID=$(podman inspect --format '{{{{.Id}}}}' "{{app_image}}")
+    "${CFSCTL}" --repo "${REPO}" oci pull "containers-storage:${IMAGE_ID}" sealed-app
+
+    echo "Sealing app image..."
+    "${CFSCTL}" --repo "${REPO}" oci seal sealed-app
+
+    echo "Signing sealed app image..."
+    "${CFSCTL}" --repo "${REPO}" oci sign sealed-app \
+        --cert "{{keys_dir}}/composefs-signing.crt" \
+        --key "{{keys_dir}}/composefs-signing.key"
+
+    echo "Verifying signature..."
+    "${CFSCTL}" --repo "${REPO}" oci verify sealed-app \
+        --cert "{{keys_dir}}/composefs-signing.crt"
+
+    echo "App image sealed and signed successfully"
+
+# Boot the host image in a bcvk VM with Secure Boot
+boot: build-host
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "Booting sealed host with bcvk..."
+    bcvk libvirt run \
+        --firmware=uefi-secure \
+        --secure-boot-keys="{{keys_dir}}" \
+        "{{host_image}}"
+
+# Run smoke tests against a running VM
+test:
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "Running smoke tests..."
+
+    bcvk libvirt run-ssh "{{host_image}}" \
+        --firmware=uefi-secure \
+        --secure-boot-keys="{{keys_dir}}" \
+        -- bash -c '
+            echo "--- Checking composefs root ---"
+            mount | grep "composefs on / " && echo "composefs root: OK"
+
+            echo "--- Checking .fs-verity keyring ---"
+            keyctl show %:.fs-verity && echo "keyring: OK"
+        '
+
+    echo "Smoke tests passed"
+
+# Build everything end-to-end
+all: build-host build-app seal-app
+
+# Clean generated artifacts
+clean:
+    #!/bin/bash
+    set -euo pipefail
+    rm -rf target/
+    rm -f cfsctl composefs-setup-root
+    podman rmi -f "{{host_image}}" "{{app_image}}" 2>/dev/null || true
+    echo "Cleaned"
